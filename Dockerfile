@@ -1,40 +1,32 @@
-# syntax=docker/dockerfile:1
+# Use a base image with Python
+FROM python:3.11-slim
 
-# FINAL docker image for music assistant server
-# This image is based on the base image and installs
-# the music assistant server from our built wheel on top.
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-ARG BASE_IMAGE_VERSION=latest
+# Set the working directory
+WORKDIR /app
 
-FROM ghcr.io/music-assistant/base:$BASE_IMAGE_VERSION
+# Copy the requirements file
+COPY requirements_all.txt .
 
-ARG MASS_VERSION
-ARG TARGETPLATFORM
-ADD dist dist
-# Install Music Assistant from prebuilt wheel
-RUN uv pip install \
-    --no-cache \
-    --find-links "https://wheels.home-assistant.io/musllinux/" \
-    "music-assistant[server]@dist/music_assistant-${MASS_VERSION}-py3-none-any.whl"
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-# Set some labels
-LABEL \
-    org.opencontainers.image.title="Music Assistant Server" \
-    org.opencontainers.image.description="Music Assistant Server/Core" \
-    org.opencontainers.image.source="https://github.com/music-assistant/server" \
-    org.opencontainers.image.authors="The Music Assistant Team" \
-    org.opencontainers.image.documentation="https://github.com/orgs/music-assistant/discussions" \
-    org.opencontainers.image.licenses="Apache License 2.0" \
-    io.hass.version="${MASS_VERSION}" \
-    io.hass.type="addon" \
-    io.hass.name="Music Assistant Server" \
-    io.hass.description="Music Assistant Server/Core" \
-    io.hass.platform="${TARGETPLATFORM}" \
-    io.hass.type="addon"
+# Install Python dependencies with timeout
+RUN pip install --upgrade pip \
+    && pip install --upgrade uv \
+    && pip install requests_toolbelt \
+    && pip install -r requirements_all.txt --timeout 100
 
-RUN rm -rf dist
+# Copy the application code
+COPY . .
 
-VOLUME [ "/data" ]
-EXPOSE 8095
+# Expose the ports the app runs on
+EXPOSE 8095 8097
 
-ENTRYPOINT ["mass", "--config", "/data"]
+# Command to run the application
+CMD ["python3", "-m", "music_assistant"]
