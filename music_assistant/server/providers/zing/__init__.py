@@ -438,7 +438,8 @@ class ZingMusicProvider(MusicProvider):
         response = self.client.execute(query, variable_values=params)
 
         album_data = response["album"]
-        self._parse_album(album_data)
+        parsed_album = self._parse_album(album_data)
+        return parsed_album
 
     async def get_track(self, prov_track_id) -> Track:
         """Get full track details by id."""
@@ -502,16 +503,43 @@ class ZingMusicProvider(MusicProvider):
         artist_obj = response["artist"]
         self._parse_artist(artist_obj)
 
+    async def get_stream_details(self, item_id: str) -> StreamDetails:
+        """Get streamdetails for a track/radio."""
+        # Get stream details for a track or radio.
+        # Implementing this method is MANDATORY to allow playback.
+        # The StreamDetails contain info how Music Assistant can play the track.
+        # item_id will always be a track or radio id. Later, when/if MA supports
+        # podcasts or audiobooks, this may as well be an episode or chapter id.
+        # You should return a StreamDetails object here with the info as accurate as possible
+        # to allow Music Assistant to process the audio using ffmpeg.
+        sd = StreamDetails(
+            provider=self.instance_id,
+            item_id=str(item_id),
+            audio_format=AudioFormat(
+                # provide details here about sample rate etc. if known
+                # set content type to unknown to let ffmpeg guess the codec/container
+                content_type=ContentType.UNKNOWN,
+            ),
+            media_type=MediaType.TRACK,
+            # streamtype defines how the stream is provided
+            # for most providers this will be HTTP but you can also use CUSTOM
+            # to provide a custom stream generator in get_audio_stream.
+            stream_type=StreamType.HTTP,
+            # explore the StreamDetails model and StreamType enum for more options
+            # but the above should be the mandatory fields to set.
+        )
+        return sd
+
     def _parse_artist(self, artist_obj: dict) -> Artist:
         """Parse a YT Artist response to Artist model object."""
 
         artist = Artist(
-            item_id=artist_obj["id"],
+            item_id=str(artist_obj["id"]),
             name=artist_obj["heName"] or artist_obj["enName"],
             provider=self.domain,
             provider_mappings={
                 ProviderMapping(
-                    item_id=artist_obj["id"],
+                    item_id=str(artist_obj["id"]),
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
                 )
@@ -525,12 +553,12 @@ class ZingMusicProvider(MusicProvider):
 
     def _parse_album(self, album_obj) -> Album:
         album = Album(
-            item_id=album_obj["id"],
+            item_id=str(album_obj["id"]),
             name=album_obj["heName"] or album_obj["enName"],
             provider=self.domain,
             provider_mappings={
                 ProviderMapping(
-                    item_id=album_obj["id"],
+                    item_id=str(album_obj["id"]),
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
                 )
@@ -547,18 +575,18 @@ class ZingMusicProvider(MusicProvider):
         return album
 
     def _parse_track(self, track_obj: dict) -> Track:
-        base_url = "https://jewishmusic.fm/wp-content/uploads/secretmusicfolder1/"
+        base_url = "https://jewishmusic.fm/wp-content/uploads/secretmusicfolder1"
         track = Track(
-            item_id=track_obj["id"],
+            item_id=str(track_obj["id"]),
             provider=self.domain,
             name=track_obj["heName"] or track_obj["enName"],
             provider_mappings={
                 ProviderMapping(
-                    item_id=track_obj["id"],
+                    item_id=str(track_obj["id"]),
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
                     available=True,
-                    url=track_obj["file"],
+                    url=base_url + track_obj["file"],
                     audio_format=AudioFormat(
                         content_type=ContentType.MP3,
                     ),
@@ -583,7 +611,7 @@ class ZingMusicProvider(MusicProvider):
                 MediaType.ALBUM, album["id"], album["heName"] or album["enName"]
             )
 
-        if "duration" in track_obj and str(track_obj["duration"]).isdigit():
+        if "duration" in track_obj and isinstance(track_obj["duration"], (int, float)):
             track.duration = int(track_obj["duration"])
 
         return track
@@ -629,7 +657,7 @@ class ZingMusicProvider(MusicProvider):
     ) -> ItemMapping:
         return ItemMapping(
             media_type=media_type,
-            item_id=key,
+            item_id=str(key),
             provider=self.instance_id,
             name=name,
         )
