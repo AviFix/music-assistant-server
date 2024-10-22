@@ -37,12 +37,7 @@ from music_assistant.common.models.enums import (
 )
 from music_assistant.common.models.errors import PlayerCommandFailed, PlayerUnavailableError
 from music_assistant.common.models.player import DeviceInfo, Player, PlayerMedia
-from music_assistant.constants import (
-    CONF_CROSSFADE,
-    CONF_ENFORCE_MP3,
-    CONF_FLOW_MODE,
-    VERBOSE_LOG_LEVEL,
-)
+from music_assistant.constants import CONF_CROSSFADE, CONF_ENFORCE_MP3, VERBOSE_LOG_LEVEL
 from music_assistant.server.helpers.didl_lite import create_didl_metadata
 from music_assistant.server.models.player_provider import PlayerProvider
 
@@ -156,10 +151,6 @@ class SonosPlayerProvider(PlayerProvider):
         self.discovery_lock = asyncio.Lock()
         self.creation_lock = asyncio.Lock()
         self._known_invisible: set[SoCo] = set()
-
-    async def loaded_in_mass(self) -> None:
-        """Call after the provider has been loaded."""
-        await self._run_discovery()
 
     async def unload(self) -> None:
         """Handle close/cleanup of the provider."""
@@ -358,7 +349,7 @@ class SonosPlayerProvider(PlayerProvider):
         except ConnectionResetError as err:
             raise PlayerUnavailableError from err
 
-    async def _run_discovery(self) -> None:
+    async def discover_players(self) -> None:
         """Discover Sonos players on the network."""
         if self._discovery_running:
             return
@@ -398,7 +389,7 @@ class SonosPlayerProvider(PlayerProvider):
 
         def reschedule() -> None:
             self._discovery_reschedule_timer = None
-            self.mass.create_task(self._run_discovery())
+            self.mass.create_task(self.discover_players())
 
         # reschedule self once finished
         self._discovery_reschedule_timer = self.mass.loop.call_later(1800, reschedule)
@@ -451,19 +442,8 @@ class SonosPlayerProvider(PlayerProvider):
                 *mass_player.supported_features,
                 PlayerFeature.VOLUME_SET,
             )
-
-        # bugfix: correct flow-mode setting as sonos doesn't support it
-        # but we did accidentally expose the setting for a couple of releases
-        # remove this after MA release 2.5+
-        self.mass.loop.call_soon_threadsafe(
-            self.mass.config.set_raw_player_config_value,
-            player_id,
-            CONF_FLOW_MODE,
-            False,
-        )
-
-        self.mass.loop.call_soon_threadsafe(
-            self.mass.players.register_or_update, sonos_player.mass_player
+        asyncio.run_coroutine_threadsafe(
+            self.mass.players.register_or_update(sonos_player.mass_player), loop=self.mass.loop
         )
 
 

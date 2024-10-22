@@ -183,6 +183,7 @@ class HomeAssistantPlayers(PlayerProvider):
 
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
+        await super().loaded_in_mass()
         player_ids: list[str] = self.config.get_value(CONF_PLAYERS)
         # prefetch the device- and entity registry
         device_registry = {x["id"]: x for x in await self.hass_prov.hass.get_device_registry()}
@@ -402,7 +403,7 @@ class HomeAssistantPlayers(PlayerProvider):
             state=StateMap.get(state["state"], PlayerState.IDLE),
         )
         self._update_player_attributes(player, state["attributes"])
-        self.mass.players.register_or_update(player)
+        await self.mass.players.register_or_update(player)
 
     def _on_entity_state_update(self, event: EntityStateEvent) -> None:
         """Handle Entity State event."""

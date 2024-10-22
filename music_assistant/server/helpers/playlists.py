@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from aiohttp import client_exceptions
 
 from music_assistant.common.models.errors import InvalidDataError
+from music_assistant.server.helpers.util import detect_charset
 
 if TYPE_CHECKING:
     from music_assistant.server import MusicAssistant
@@ -27,6 +28,8 @@ HLS_CONTENT_TYPES = (
 
 class IsHLSPlaylist(InvalidDataError):
     """The playlist from an HLS stream and should not be parsed."""
+
+    encrypted: bool = False
 
 
 @dataclass
@@ -142,14 +145,18 @@ def parse_pls(pls_data: str) -> list[PlaylistItem]:
     return playlist
 
 
-async def fetch_playlist(mass: MusicAssistant, url: str) -> list[PlaylistItem]:
+async def fetch_playlist(
+    mass: MusicAssistant, url: str, raise_on_hls: bool = True
+) -> list[PlaylistItem]:
     """Parse an online m3u or pls playlist."""
     try:
         async with mass.http_session.get(url, allow_redirects=True, timeout=5) as resp:
-            charset = resp.charset or "utf-8"
             try:
-                playlist_data = (await resp.content.read(64 * 1024)).decode(charset)
-            except ValueError as err:
+                raw_data = await resp.content.read(64 * 1024)
+                # NOTE: using resp.charset is not reliable, we need to detect it ourselves
+                encoding = resp.charset or await detect_charset(raw_data)
+                playlist_data = raw_data.decode(encoding, errors="replace")
+            except (ValueError, UnicodeDecodeError) as err:
                 msg = f"Could not decode playlist {url}"
                 raise InvalidDataError(msg) from err
     except TimeoutError as err:
@@ -159,8 +166,10 @@ async def fetch_playlist(mass: MusicAssistant, url: str) -> list[PlaylistItem]:
         msg = f"Error while fetching playlist {url}"
         raise InvalidDataError(msg) from err
 
-    if "#EXT-X-VERSION:" in playlist_data or "#EXT-X-STREAM-INF:" in playlist_data:
-        raise IsHLSPlaylist
+    if raise_on_hls and "#EXT-X-VERSION:" in playlist_data or "#EXT-X-STREAM-INF:" in playlist_data:
+        exc = IsHLSPlaylist()
+        exc.encrypted = "#EXT-X-KEY:" in playlist_data
+        raise exc
 
     if url.endswith((".m3u", ".m3u8")):
         playlist = parse_m3u(playlist_data)

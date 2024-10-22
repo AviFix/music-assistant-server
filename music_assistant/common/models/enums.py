@@ -290,6 +290,7 @@ class PlayerFeature(StrEnum):
     PAUSE = "pause"
     SYNC = "sync"
     SEEK = "seek"
+    NEXT_PREVIOUS = "next_previous"
     PLAY_ANNOUNCEMENT = "play_announcement"
     UNKNOWN = "unknown"
 
@@ -368,6 +369,7 @@ class ProviderFeature(StrEnum):
     # PLAYERPROVIDER FEATURES
     #
     SYNC_PLAYERS = "sync_players"
+    REMOVE_PLAYER = "remove_player"
 
     #
     # METADATAPROVIDER FEATURES
@@ -425,6 +427,7 @@ class StreamType(StrEnum):
     HTTP = "http"  # regular http stream
     ENCRYPTED_HTTP = "encrypted_http"  # encrypted http stream
     HLS = "hls"  # http HLS stream
+    ENCRYPTED_HLS = "encrypted_hls"  # encrypted HLS stream
     ICY = "icy"  # http stream with icy metadata
     LOCAL_FILE = "local_file"
     CUSTOM = "custom"
