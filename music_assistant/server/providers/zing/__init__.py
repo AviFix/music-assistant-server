@@ -82,6 +82,7 @@ class ZingMusicProvider(MusicProvider):
             ProviderFeature.LIBRARY_ARTISTS,
             ProviderFeature.LIBRARY_TRACKS,
             ProviderFeature.ARTIST_ALBUMS,
+            ProviderFeature.SIMILAR_TRACKS,
         )
 
     @property
@@ -503,6 +504,14 @@ class ZingMusicProvider(MusicProvider):
         artist_obj = response["artist"]
         self._parse_artist(artist_obj)
 
+    async def get_similar_tracks(  # type: ignore[return]
+        self, prov_track_id: str, limit: int = 25
+    ) -> list[Track]:
+        """Retrieve a dynamic list of similar tracks based on the provided track."""
+        # Get a list of similar tracks based on the provided track.
+        # This is only called if the provider supports the SIMILAR_TRACKS feature.
+        return []
+
     async def get_stream_details(self, item_id: str) -> StreamDetails:
         """Get streamdetails for a track/radio."""
         # Get stream details for a track or radio.
@@ -575,7 +584,8 @@ class ZingMusicProvider(MusicProvider):
         return album
 
     def _parse_track(self, track_obj: dict) -> Track:
-        base_url = "https://jewishmusic.fm/wp-content/uploads/secretmusicfolder1"
+        url = "https://jewishmusic.fm/wp-content/uploads/secretmusicfolder1" + \
+            track_obj["file"]
         track = Track(
             item_id=str(track_obj["id"]),
             provider=self.domain,
@@ -586,7 +596,7 @@ class ZingMusicProvider(MusicProvider):
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
                     available=True,
-                    url=base_url + track_obj["file"],
+                    url=url,
                     audio_format=AudioFormat(
                         content_type=ContentType.MP3,
                     ),
