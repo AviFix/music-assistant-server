@@ -1,0 +1,10 @@
+{
+  "type": "music",
+  "domain": "zing",
+  "name": "Zing",
+  "description": "Access music from Zing via GraphQL",
+  "codeowners": ["@openai"],
+  "requirements": [],
+  "documentation": "",
+  "multi_instance": false
+}
