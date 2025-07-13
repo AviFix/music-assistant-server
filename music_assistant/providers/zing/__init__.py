@@ -6,8 +6,10 @@ from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import ClientResponseError
+from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
     ContentType,
+    ImageType,
     MediaType,
     ProviderFeature,
     StreamType,
@@ -45,6 +47,16 @@ async def setup(
     return ZingProvider(mass, manifest, config)
 
 
+async def get_config_entries(
+    mass: MusicAssistant,
+    instance_id: str | None = None,
+    action: str | None = None,
+    values: dict[str, Any] | None = None,
+) -> tuple[ConfigEntry, ...]:
+    """Return Config entries for this provider."""
+    return ()  # No config entries needed for this provider
+
+
 class ZingProvider(MusicProvider):
     """Support for the Zing GraphQL music provider."""
 
@@ -59,58 +71,159 @@ class ZingProvider(MusicProvider):
             ProviderFeature.LIBRARY_ALBUMS,
             ProviderFeature.LIBRARY_TRACKS,
             ProviderFeature.LIBRARY_PLAYLISTS,
-            ProviderFeature.LIBRARY_RADIOS,
             ProviderFeature.ARTIST_ALBUMS,
             ProviderFeature.ARTIST_TOPTRACKS,
-            ProviderFeature.SIMILAR_TRACKS,
         }
 
     async def _graphql(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         """Perform a GraphQL request."""
         variables = variables or {}
+        self.logger.debug(f"Making GraphQL request to {self.api_url}")
+        self.logger.debug(f"Query: {query[:100]}..." if len(query) > 100 else f"Query: {query}")
+        if variables:
+            self.logger.debug(f"Variables: {variables}")
+        
         try:
+            request_data = {"query": query, "variables": variables}
+            self.logger.debug(f"Request data: {request_data}")
+            
             async with self.mass.http_session.post(
-                self.api_url, json={"query": query, "variables": variables}
+                self.api_url, json=request_data
             ) as resp:
+                self.logger.debug(f"GraphQL response status: {resp.status}")
+                
+                if resp.status != 200:
+                    # Try to get error details
+                    try:
+                        error_data = await resp.text()
+                        self.logger.error(f"GraphQL error response: {error_data}")
+                    except:
+                        pass
+                
                 resp.raise_for_status()
                 data = await resp.json()
+                self.logger.debug(f"GraphQL response received, data keys: {list(data.keys()) if isinstance(data, dict) else 'not dict'}")
         except ClientResponseError as err:
+            self.logger.error(f"GraphQL request failed with status {err.status}: {err}")
             raise ProviderUnavailableError(str(err)) from err
+        except Exception as e:
+            self.logger.error(f"GraphQL request failed with exception: {e}")
+            raise ProviderUnavailableError(str(e)) from e
+        
         if "errors" in data:
-            raise ProviderUnavailableError(data["errors"][0].get("message", "unknown error"))
+            error_msg = data["errors"][0].get("message", "unknown error")
+            self.logger.error(f"GraphQL returned errors: {error_msg}")
+            self.logger.error(f"Full GraphQL error data: {data['errors']}")
+            raise ProviderUnavailableError(error_msg)
+        
         return data.get("data")
 
     async def search(
         self, search_query: str, media_types: list[MediaType], limit: int = 5
     ) -> SearchResults:
         """Perform a search on the provider."""
-        query = """
-        query Search($query: String!, $limit: Int!) {
-            search(query: $query, limit: $limit) {
-                tracks { id title duration url album { id title } artists { id name } }
-                albums { id title artists { id name } }
-                artists { id name }
-            }
-        }
-        """
-        data = await self._graphql(query, {"query": search_query, "limit": limit})
+        import json
+        
         results = SearchResults()
-        if not data or "search" not in data:
-            return results
-        search_data = data["search"]
-        if MediaType.TRACK in media_types and search_data.get("tracks"):
-            results.tracks = [self._parse_track(item) for item in search_data["tracks"]][:limit]
-        if MediaType.ALBUM in media_types and search_data.get("albums"):
-            results.albums = [self._parse_album(item) for item in search_data["albums"]][:limit]
-        if MediaType.ARTIST in media_types and search_data.get("artists"):
-            results.artists = [self._parse_artist(item) for item in search_data["artists"]][:limit]
+        
+        # Search for tracks
+        if MediaType.TRACK in media_types:
+            track_query = {
+                "query": {
+                    "match": {
+                        "enName": search_query
+                    }
+                },
+                "size": limit
+            }
+            track_data = await self._graphql(
+                "query SearchElastic($index: String!, $query: String!) { searchElastic(index: $index, query: $query) }",
+                {"index": "tracks", "query": json.dumps(track_query)}
+            )
+            if track_data and track_data.get("searchElastic"):
+                try:
+                    elastic_data = json.loads(track_data["searchElastic"])
+                    if "hits" in elastic_data and "hits" in elastic_data["hits"]:
+                        tracks = []
+                        for hit in elastic_data["hits"]["hits"]:
+                            source = hit["_source"]
+                            track = self._parse_track_from_elastic(source)
+                            if track:
+                                tracks.append(track)
+                                if len(tracks) >= limit:
+                                    break
+                        results.tracks = tracks
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        
+        # Search for albums
+        if MediaType.ALBUM in media_types:
+            album_query = {
+                "query": {
+                    "match": {
+                        "enName": search_query
+                    }
+                },
+                "size": limit
+            }
+            album_data = await self._graphql(
+                "query SearchElastic($index: String!, $query: String!) { searchElastic(index: $index, query: $query) }",
+                {"index": "albums", "query": json.dumps(album_query)}
+            )
+            if album_data and album_data.get("searchElastic"):
+                try:
+                    elastic_data = json.loads(album_data["searchElastic"])
+                    if "hits" in elastic_data and "hits" in elastic_data["hits"]:
+                        albums = []
+                        for hit in elastic_data["hits"]["hits"]:
+                            source = hit["_source"]
+                            album = self._parse_album_from_elastic(source)
+                            if album:
+                                albums.append(album)
+                                if len(albums) >= limit:
+                                    break
+                        results.albums = albums
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        
+        # Search for artists
+        if MediaType.ARTIST in media_types:
+            artist_query = {
+                "query": {
+                    "match": {
+                        "enName": search_query
+                    }
+                },
+                "size": limit
+            }
+            artist_data = await self._graphql(
+                "query SearchElastic($index: String!, $query: String!) { searchElastic(index: $index, query: $query) }",
+                {"index": "artists", "query": json.dumps(artist_query)}
+            )
+            if artist_data and artist_data.get("searchElastic"):
+                try:
+                    elastic_data = json.loads(artist_data["searchElastic"])
+                    if "hits" in elastic_data and "hits" in elastic_data["hits"]:
+                        artists = []
+                        for hit in elastic_data["hits"]["hits"]:
+                            source = hit["_source"]
+                            artist = self._parse_artist_from_elastic(source)
+                            if artist:
+                                artists.append(artist)
+                                if len(artists) >= limit:
+                                    break
+                        results.artists = artists
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        
         return results
 
     def _parse_artist(self, data: dict[str, Any]) -> Artist:
-        return Artist(
+        artist_name = data.get("heName") or data.get("enName") or "Unknown Artist"
+        artist = Artist(
             item_id=str(data["id"]),
             provider=self.instance_id,
-            name=data.get("name") or "Unknown Artist",
+            name=artist_name,
             provider_mappings={
                 ProviderMapping(
                     item_id=str(data["id"]),
@@ -119,13 +232,50 @@ class ZingProvider(MusicProvider):
                 )
             },
         )
+        if images_data := data.get("images"):
+            from music_assistant_models.media_items import MediaItemImage
+            image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
+            if image_url:
+                self.logger.debug(f"Adding image to artist {artist_name}: {image_url}")
+                artist.metadata.images = UniqueList([
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=image_url,
+                        provider=self.instance_id,
+                    )
+                ])
+            else:
+                self.logger.debug(f"No valid image URL found for artist {artist_name}")
+        else:
+            self.logger.debug(f"No images data found for artist {artist_name}")
+        return artist
 
     def _parse_album(self, data: dict[str, Any]) -> Album:
-        artists = [self._parse_artist(art) for art in data.get("artists", [])]
-        return Album(
+        artists_data = data.get("artists", [])
+        if not artists_data:
+            # Create a default "heName" if no artists are provided
+            # Music Assistant requires albums to have at least one artist
+            artists = [
+                Artist(
+                    item_id="unknown",
+                    provider=self.instance_id,
+                    name="heName",
+                    provider_mappings={
+                        ProviderMapping(
+                            item_id="unknown",
+                            provider_domain=self.domain,
+                            provider_instance=self.instance_id,
+                        )
+                    },
+                )
+            ]
+        else:
+            artists = [self._parse_artist(art) for art in artists_data]
+        
+        album = Album(
             item_id=str(data["id"]),
             provider=self.instance_id,
-            name=data.get("title") or "Unknown Album",
+            name=data.get("heName") or data.get("enName") or "Unknown Album",
             artists=UniqueList(artists),
             provider_mappings={
                 ProviderMapping(
@@ -135,14 +285,42 @@ class ZingProvider(MusicProvider):
                 )
             },
         )
+        if images_data := data.get("images"):
+            from music_assistant_models.media_items import MediaItemImage
+            image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
+            if image_url:
+                self.logger.debug(f"Adding image to album {data.get('heName') or data.get('enName')}: {image_url}")
+                album.metadata.images = UniqueList([
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=image_url,
+                        provider=self.instance_id,
+                    )
+                ])
+            else:
+                self.logger.debug(f"No valid image URL found in images data for album {data.get('heName') or data.get('enName')}")
+                self.logger.debug(f"Images data structure: {images_data}")
+        else:
+            self.logger.debug(f"No images data found for album {data.get('heName') or data.get('enName')}")
+        return album
 
     def _parse_track(self, data: dict[str, Any]) -> Track:
+        track_name = data.get("heName") or data.get("enName") or "Unknown Track"
+        file_path = data.get("file")
+        
+        # Log track parsing details
+        self.logger.debug(f"Parsing track: {track_name} (ID: {data.get('id')})")
+        if file_path:
+            self.logger.debug(f"Track {track_name} has audio file: {file_path}")
+        else:
+            self.logger.warning(f"Track {track_name} has no audio file path")
+        
         artists = [self._parse_artist(art) for art in data.get("artists", [])]
         album = self._parse_album(data["album"]) if data.get("album") else None
-        return Track(
+        track = Track(
             item_id=str(data["id"]),
             provider=self.instance_id,
-            name=data.get("title") or "Unknown Track",
+            name=track_name,
             duration=int(data.get("duration") or 0),
             artists=UniqueList(artists),
             album=album,
@@ -151,95 +329,496 @@ class ZingProvider(MusicProvider):
                     item_id=str(data["id"]),
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
+                    details=file_path,  # Store the file path for streaming
                 )
             },
         )
+        if images_data := data.get("images"):
+            from music_assistant_models.media_items import MediaItemImage
+            image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
+            if image_url:
+                self.logger.debug(f"Adding image to track {track_name}: {image_url}")
+                track.metadata.images = UniqueList([
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=image_url,
+                        provider=self.instance_id,
+                    )
+                ])
+            else:
+                self.logger.debug(f"No valid image URL found for track {track_name}")
+        else:
+            self.logger.debug(f"No images data found for track {track_name}")
+        return track
+
+    def _parse_track_from_elastic(self, data: dict[str, Any]) -> Track | None:
+        """Parse track data from Elasticsearch response."""
+        try:
+            artists = [self._parse_artist(art) for art in data.get("artists", [])]
+            album = self._parse_album_from_elastic(data["album"]) if data.get("album") else None
+            track = Track(
+                item_id=str(data["id"]),
+                provider=self.instance_id,
+                name=data.get("heName") or data.get("enName") or "Unknown Track",
+                duration=int(data.get("duration") or 0),
+                artists=UniqueList(artists),
+                album=album,
+                provider_mappings={
+                    ProviderMapping(
+                        item_id=str(data["id"]),
+                        provider_domain=self.domain,
+                        provider_instance=self.instance_id,
+                        details=data.get("file"),  # Store the file path for streaming
+                    )
+                },
+            )
+            if images_data := data.get("images"):
+                from music_assistant_models.media_items import MediaItemImage
+                image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
+                if image_url:
+                    track.metadata.images = UniqueList([
+                        MediaItemImage(
+                            type=ImageType.THUMB,
+                            path=image_url,
+                            provider=self.instance_id,
+                        )
+                    ])
+            return track
+        except (KeyError, ValueError):
+            return None
+
+    def _parse_album_from_elastic(self, data: dict[str, Any]) -> Album | None:
+        """Parse album data from Elasticsearch response."""
+        try:
+            artists_data = data.get("artists", [])
+            if not artists_data:
+                # Create a default "heName" if no artists are provided
+                # Music Assistant requires albums to have at least one artist
+                artists = [
+                    Artist(
+                        item_id="unknown",
+                        provider=self.instance_id,
+                        name="heName",
+                        provider_mappings={
+                            ProviderMapping(
+                                item_id="unknown",
+                                provider_domain=self.domain,
+                                provider_instance=self.instance_id,
+                            )
+                        },
+                    )
+                ]
+            else:
+                artists = [self._parse_artist(art) for art in artists_data]
+            
+            album = Album(
+                item_id=str(data["id"]),
+                provider=self.instance_id,
+                name=data.get("heName") or data.get("enName") or "Unknown Album",
+                artists=UniqueList(artists),
+                provider_mappings={
+                    ProviderMapping(
+                        item_id=str(data["id"]),
+                        provider_domain=self.domain,
+                        provider_instance=self.instance_id,
+                    )
+                },
+            )
+            if images_data := data.get("images"):
+                from music_assistant_models.media_items import MediaItemImage
+                image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
+                if image_url:
+                    album.metadata.images = UniqueList([
+                        MediaItemImage(
+                            type=ImageType.THUMB,
+                            path=image_url,
+                            provider=self.instance_id,
+                        )
+                    ])
+            return album
+        except (KeyError, ValueError):
+            return None
+
+    def _parse_artist_from_elastic(self, data: dict[str, Any]) -> Artist | None:
+        """Parse artist data from Elasticsearch response."""
+        try:
+            artist = Artist(
+                item_id=str(data["id"]),
+                provider=self.instance_id,
+                name=data.get("heName") or data.get("enName") or "Unknown Artist",
+                provider_mappings={
+                    ProviderMapping(
+                        item_id=str(data["id"]),
+                        provider_domain=self.domain,
+                        provider_instance=self.instance_id,
+                    )
+                },
+            )
+            if images_data := data.get("images"):
+                from music_assistant_models.media_items import MediaItemImage
+                image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
+                if image_url:
+                    artist.metadata.images = UniqueList([
+                        MediaItemImage(
+                            type=ImageType.THUMB,
+                            path=image_url,
+                            provider=self.instance_id,
+                        )
+                    ])
+            return artist
+        except (KeyError, ValueError):
+            return None
 
     async def get_track(self, prov_track_id: str) -> Track:
         """Return full track details."""
-        query = """
-        query GetTrack($id: ID!) {
-            track(id: $id) {
-                id title duration url album { id title } artists { id name }
+        self.logger.info(f"Getting track details for ID: {prov_track_id}")
+        try:
+            query = """
+            query GetTrackById($trackId: Int!) {
+                track(where: { id: $trackId }) {
+                    id
+                    trackNumber
+                    enName
+                    heName
+                    file
+                    duration
+                    album {
+                        id
+                        enName
+                        heName
+                    }
+                    artists {
+                        id
+                        enName
+                        heName
+                    }
+                    genres {
+                        id
+                        enName
+                        heName
+                    }
+                    images
+                }
             }
-        }
-        """
-        data = await self._graphql(query, {"id": prov_track_id})
-        track_data = data.get("track") if data else None
-        if not track_data:
-            raise ProviderUnavailableError(f"Track {prov_track_id} not found")
-        return self._parse_track(track_data)
+            """
+            variables = {"trackId": int(prov_track_id)}
+            self.logger.debug(f"GraphQL variables: {variables}")
+            
+            data = await self._graphql(query, variables)
+            track_data = data.get("track") if data else None
+            
+            if not track_data:
+                self.logger.error(f"Track {prov_track_id} not found in API response")
+                self.logger.debug(f"API response data: {data}")
+                raise ProviderUnavailableError(f"Track {prov_track_id} not found")
+            
+            self.logger.info(f"Successfully retrieved track data for ID: {prov_track_id}")
+            return self._parse_track(track_data)
+            
+        except Exception as e:
+            self.logger.error(f"Error getting track {prov_track_id}: {e}")
+            raise ProviderUnavailableError(f"Failed to get track {prov_track_id}: {e}")
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
-        """Return stream details for a track."""
-        track = await self.get_track(item_id)
-        return StreamDetails(
-            item_id=track.item_id,
-            provider=self.instance_id,
-            audio_format=AudioFormat(content_type=ContentType.UNKNOWN),
-            stream_type=StreamType.HTTP,
-            path=(
-                track.provider_mappings[0].item_id
-                if hasattr(track.provider_mappings, "__getitem__")
-                else track.item_id
-            ),
-            duration=track.duration,
-            can_seek=True,
-            allow_seek=True,
-        )
+        """Return the content details for the given track when it will be streamed."""
+        try:
+            # Get track details to construct the audio URL
+            track = await self.get_track(item_id)
+            
+            # Extract the file path from the track's provider mapping details
+            file_path = None
+            for mapping in track.provider_mappings:
+                if mapping.details:
+                    file_path = mapping.details
+                    break
+            
+            if not file_path:
+                raise ProviderUnavailableError(f"No audio file path found for track {item_id}")
+            
+            # Construct the full audio URL
+            audio_url = f"{self.api_url.replace(':4000/graphql', '')}/wp-content/uploads/secretmusicfolder1{file_path}"
+            
+            # Log the constructed URL for debugging
+            self.logger.info(f"Constructed audio URL for track {item_id}: {audio_url}")
+            
+            return StreamDetails(
+                provider=self.instance_id,
+                item_id=track.item_id,
+                audio_format=AudioFormat(content_type=ContentType.MP3),
+                stream_type=StreamType.CUSTOM,  # Use CUSTOM to enable our custom get_audio_stream method
+                path=audio_url,
+                duration=track.duration,
+                can_seek=True,
+                allow_seek=True,
+            )
+        except Exception as e:
+            self.logger.error(f"Error getting stream details for track {item_id}: {e}")
+            raise ProviderUnavailableError(f"Failed to get stream details for track {item_id}: {e}")
+
+    async def get_audio_stream(
+        self, streamdetails: StreamDetails, seek_position: int = 0
+    ) -> AsyncGenerator[bytes, None]:
+        """Get audio stream with proper headers to bypass CORS."""
+        if not streamdetails.path:
+            raise ProviderUnavailableError("No audio path available")
+        
+        # Log the stream URL for debugging
+        self.logger.info(f"Starting audio stream for track {streamdetails.item_id}")
+        self.logger.info(f"Stream URL: {streamdetails.path}")
+        self.logger.info(f"Seek position: {seek_position}")
+            
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; MusicAssistant/1.0)",
+            "Referer": "https://zingmusic.app/",
+            "Origin": "https://zingmusic.app",
+        }
+        
+        # Add range header for seeking if needed
+        if seek_position > 0:
+            headers["Range"] = f"bytes={seek_position}-"
+        
+        try:
+            async with self.mass.http_session.get(
+                streamdetails.path, 
+                headers=headers
+            ) as response:
+                response.raise_for_status()
+                
+                self.logger.info(f"HTTP response status: {response.status}")
+                self.logger.info(f"HTTP response headers: {dict(response.headers)}")
+                self.logger.info("Starting to stream audio chunks...")
+                
+                chunk_count = 0
+                async for chunk in response.content.iter_chunked(8192):
+                    chunk_count += 1
+                    if chunk_count % 10 == 0:  # Log every 10th chunk
+                        self.logger.info(f"Streamed {chunk_count} chunks, current chunk size: {len(chunk)} bytes")
+                    yield chunk
+                    
+        except Exception as e:
+            self.logger.error(f"Error streaming audio for track {streamdetails.item_id}: {e}")
+            raise ProviderUnavailableError(f"Failed to stream audio: {e}")
+
+
+
+
 
     # Library queries
     async def get_library_artists(self) -> AsyncGenerator[Artist, None]:
         """Retrieve all artists from the library."""
+        self.logger.info("Starting library artists sync...")
+        
+        # Limit to first 100 artists only
+        limit = 100
+        self.logger.info(f"Fetching first {limit} artists only")
+        
+        # Use a simple query with limit
         query = """
-        query { artists { id name } }
+        query GetArtists($take: Int!) { 
+            artists(take: $take) { 
+                id 
+                enName 
+                heName 
+                images { small medium large } 
+            } 
+        }
         """
-        data = await self._graphql(query)
-        for item in data.get("artists", []):
-            yield self._parse_artist(item)
+        
+        try:
+            data = await self._graphql(query, {"take": limit})
+            artists_data = data.get("artists", [])
+            
+            self.logger.info(f"Retrieved {len(artists_data)} artists from API")
+            
+            total_processed = 0
+            for item in artists_data:
+                try:
+                    artist = self._parse_artist(item)
+                    total_processed += 1
+                    if total_processed % 50 == 0:  # Log every 50th artist
+                        self.logger.info(f"Processed {total_processed} artists total")
+                    yield artist
+                except Exception as e:
+                    self.logger.error(f"Error parsing artist {item.get('id', 'unknown')}: {e}")
+                    continue
+            
+            # Log completion after all items are yielded
+            self.logger.info(f"Completed library artists sync. Successfully processed {total_processed} artists")
+        except Exception as e:
+            self.logger.error(f"Error during library artists sync: {e}")
+            raise
 
     async def get_library_albums(self) -> AsyncGenerator[Album, None]:
         """Retrieve all albums from the library."""
+        self.logger.info("Starting library albums sync...")
+        
+        # Limit to first 100 albums only
+        limit = 100
+        self.logger.info(f"Fetching first {limit} albums only")
+        
+        # Use a simple query with limit
         query = """
-        query { albums { id title artists { id name } } }
+        query GetAlbums($take: Int!) { 
+            albums(take: $take) { 
+                id 
+                enName 
+                heName 
+                images { small medium large } 
+                artists { id enName heName images { small medium large } } 
+            } 
+        }
         """
-        data = await self._graphql(query)
-        for item in data.get("albums", []):
-            yield self._parse_album(item)
+        
+        try:
+            data = await self._graphql(query, {"take": limit})
+            albums_data = data.get("albums", [])
+            
+            self.logger.info(f"Retrieved {len(albums_data)} albums from API")
+            
+            total_processed = 0
+            for item in albums_data:
+                try:
+                    album = self._parse_album(item)
+                    total_processed += 1
+                    if total_processed % 50 == 0:  # Log every 50th album
+                        self.logger.info(f"Processed {total_processed} albums total")
+                    yield album
+                except Exception as e:
+                    self.logger.error(f"Error parsing album {item.get('id', 'unknown')}: {e}")
+                    continue
+            
+            # Log completion after all items are yielded
+            self.logger.info(f"Completed library albums sync. Successfully processed {total_processed} albums")
+        except Exception as e:
+            self.logger.error(f"Error during library albums sync: {e}")
+            raise
 
     async def get_library_tracks(self) -> AsyncGenerator[Track, None]:
         """Retrieve all tracks from the library."""
+        self.logger.info("Starting library tracks sync...")
+        
+        # Limit to first 100 tracks only
+        limit = 100
+        self.logger.info(f"Fetching first {limit} tracks only")
+        
+        # Use a simple query with limit and essential track and artist data
         query = """
-        query { tracks { id title duration url album { id title } artists { id name } } }
+        query GetTracks($take: Int!) { 
+            tracks(take: $take) { 
+                id 
+                enName 
+                heName 
+                duration 
+                file 
+                artists { 
+                    id 
+                    enName 
+                    heName 
+                } 
+            } 
+        }
         """
-        data = await self._graphql(query)
-        for item in data.get("tracks", []):
-            yield self._parse_track(item)
+        
+        try:
+            data = await self._graphql(query, {"take": limit})
+            tracks_data = data.get("tracks", [])
+            
+            self.logger.info(f"Retrieved {len(tracks_data)} tracks from API")
+            
+            total_processed = 0
+            for item in tracks_data:
+                try:
+                    # Create a minimal track with just the basic data
+                    track_name = item.get("heName") or item.get("enName") or "Unknown Artist"
+                    file_path = item.get("file")
+                    
+                    # Parse artists from the track data
+                    artists = []
+                    for artist_data in item.get("artists", []):
+                        artist_name = artist_data.get("heName") or artist_data.get("enName") or "Unknown Artist"
+                        artist = Artist(
+                            item_id=str(artist_data["id"]),
+                            provider=self.instance_id,
+                            name=artist_name,
+                            provider_mappings={
+                                ProviderMapping(
+                                    item_id=str(artist_data["id"]),
+                                    provider_domain=self.domain,
+                                    provider_instance=self.instance_id,
+                                )
+                            },
+                        )
+                        artists.append(artist)
+                    
+                    # If no artists found, create a default "Unknown Artist"
+                    if not artists:
+                        default_artist = Artist(
+                            item_id="unknown",
+                            provider=self.instance_id,
+                            name="Unknown Artist",
+                            provider_mappings={
+                                ProviderMapping(
+                                    item_id="unknown",
+                                    provider_domain=self.domain,
+                                    provider_instance=self.instance_id,
+                                )
+                            },
+                        )
+                        artists.append(default_artist)
+                    
+                    # Create a simple track with artist information
+                    track = Track(
+                        item_id=str(item["id"]),
+                        provider=self.instance_id,
+                        name=track_name,
+                        duration=int(item.get("duration") or 0),
+                        artists=UniqueList(artists),
+                        album=None,  # No album data for now
+                        provider_mappings={
+                            ProviderMapping(
+                                item_id=str(item["id"]),
+                                provider_domain=self.domain,
+                                provider_instance=self.instance_id,
+                                details=file_path,  # Store the file path for streaming
+                            )
+                        },
+                    )
+                    
+                    total_processed += 1
+                    if total_processed % 50 == 0:  # Log every 50th track
+                        self.logger.info(f"Processed {total_processed} tracks total")
+                    yield track
+                except Exception as e:
+                    self.logger.error(f"Error parsing track {item.get('id', 'unknown')}: {e}")
+                    continue
+            
+            # Log completion after all items are yielded
+            self.logger.info(f"Completed library tracks sync. Successfully processed {total_processed} tracks")
+        except Exception as e:
+            self.logger.error(f"Error during library tracks sync: {e}")
+            raise
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
         """Retrieve all playlists from the library."""
-        query = """
-        query { playlists { id title } }
-        """
-        data = await self._graphql(query)
-        for item in data.get("playlists", []):
-            yield self._parse_playlist(item)
+        # Temporarily disabled due to large number of playlists (124,112)
+        self.logger.info("Library playlists sync temporarily disabled")
+        return
+        yield
 
     async def get_library_radios(self) -> AsyncGenerator[Radio, None]:
         """Retrieve all radio stations from the library."""
-        query = """
-        query { radios { id title url } }
-        """
-        data = await self._graphql(query)
-        for item in data.get("radios", []):
-            yield self._parse_radio(item)
+        # Radio functionality not available in this API
+        return
+        yield
 
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Return full artist details."""
         query = """
-        query GetArtist($id: ID!) { artist(id: $id) { id name } }
+        query GetArtist($where: ArtistWhereUniqueInput!) { 
+            artist(where: $where) { id enName heName } 
+        }
         """
-        data = await self._graphql(query, {"id": prov_artist_id})
+        data = await self._graphql(query, {"where": {"id": int(prov_artist_id)}})
         artist_data = data.get("artist") if data else None
         if not artist_data:
             raise ProviderUnavailableError(f"Artist {prov_artist_id} not found")
@@ -248,13 +827,13 @@ class ZingProvider(MusicProvider):
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Return albums for the given artist."""
         query = """
-        query GetArtistAlbums($id: ID!) {
-            artist(id: $id) {
-                albums { id title artists { id name } }
+        query GetArtistAlbums($where: ArtistWhereUniqueInput!) {
+            artist(where: $where) {
+                albums { id enName heName artists { id enName heName } }
             }
         }
         """
-        data = await self._graphql(query, {"id": prov_artist_id})
+        data = await self._graphql(query, {"where": {"id": int(prov_artist_id)}})
         artist = data.get("artist") if data else None
         if not artist:
             return []
@@ -263,24 +842,26 @@ class ZingProvider(MusicProvider):
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Return top tracks for the given artist."""
         query = """
-        query GetArtistTop($id: ID!) {
-            artist(id: $id) {
-                topTracks { id title duration url album { id title } artists { id name } }
+        query GetArtistTop($where: ArtistWhereUniqueInput!) {
+            artist(where: $where) {
+                tracks { id enName heName duration file album { id enName heName } artists { id enName heName } }
             }
         }
         """
-        data = await self._graphql(query, {"id": prov_artist_id})
+        data = await self._graphql(query, {"where": {"id": int(prov_artist_id)}})
         artist = data.get("artist") if data else None
         if not artist:
             return []
-        return [self._parse_track(item) for item in artist.get("topTracks", [])]
+        return [self._parse_track(item) for item in artist.get("tracks", [])]
 
     async def get_album(self, prov_album_id: str) -> Album:
         """Return full album details."""
         query = """
-        query GetAlbum($id: ID!) { album(id: $id) { id title artists { id name } } }
+        query GetAlbum($where: AlbumWhereUniqueInput!) { 
+            album(where: $where) { id enName heName artists { id enName heName } } 
+        }
         """
-        data = await self._graphql(query, {"id": prov_album_id})
+        data = await self._graphql(query, {"where": {"id": int(prov_album_id)}})
         album_data = data.get("album") if data else None
         if not album_data:
             raise ProviderUnavailableError(f"Album {prov_album_id} not found")
@@ -289,20 +870,21 @@ class ZingProvider(MusicProvider):
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """Return the tracks for the given album."""
         query = """
-        query GetAlbum($id: ID!) {
-            album(id: $id) {
+        query GetAlbum($where: AlbumWhereUniqueInput!) {
+            album(where: $where) {
                 tracks {
                     id
-                    title
+                    enName
+                    heName
                     duration
-                    url
-                    artists { id name }
-                    album { id title }
+                    file
+                    artists { id enName heName }
+                    album { id enName heName }
                 }
             }
         }
         """
-        data = await self._graphql(query, {"id": prov_album_id})
+        data = await self._graphql(query, {"where": {"id": int(prov_album_id)}})
         album = data.get("album") if data else None
         if not album:
             return []
@@ -311,9 +893,11 @@ class ZingProvider(MusicProvider):
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Return full playlist details."""
         query = """
-        query GetPlaylist($id: ID!) { playlist(id: $id) { id title } }
+        query GetPlaylist($where: PlaylistWhereUniqueInput!) { 
+            playlist(where: $where) { id enName heName } 
+        }
         """
-        data = await self._graphql(query, {"id": prov_playlist_id})
+        data = await self._graphql(query, {"where": {"id": int(prov_playlist_id)}})
         playlist_data = data.get("playlist") if data else None
         if not playlist_data:
             raise ProviderUnavailableError(f"Playlist {prov_playlist_id} not found")
@@ -321,38 +905,20 @@ class ZingProvider(MusicProvider):
 
     async def get_radio(self, prov_radio_id: str) -> Radio:
         """Return radio station details."""
-        query = """
-        query GetRadio($id: ID!) { radio(id: $id) { id title url } }
-        """
-        data = await self._graphql(query, {"id": prov_radio_id})
-        radio_data = data.get("radio") if data else None
-        if not radio_data:
-            raise ProviderUnavailableError(f"Radio {prov_radio_id} not found")
-        return self._parse_radio(radio_data)
+        # Radio functionality not available in this API
+        raise ProviderUnavailableError(f"Radio {prov_radio_id} not found")
 
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
         """Retrieve tracks similar to the provided track."""
-        query = """
-        query Similar($id: ID!, $limit: Int!) {
-            similarTracks(id: $id, limit: $limit) {
-                id
-                title
-                duration
-                url
-                album { id title }
-                artists { id name }
-            }
-        }
-        """
-        data = await self._graphql(query, {"id": prov_track_id, "limit": limit})
-        return [self._parse_track(item) for item in data.get("similarTracks", [])]
+        # Similar tracks functionality not available in this API
+        return []
 
     # parsers for playlists and radios
     def _parse_playlist(self, data: dict[str, Any]) -> Playlist:
-        return Playlist(
+        playlist = Playlist(
             item_id=str(data["id"]),
             provider=self.instance_id,
-            name=data.get("title") or data.get("name") or "Unknown Playlist",
+            name=data.get("heName") or data.get("enName") or "Unknown Artist",
             provider_mappings={
                 ProviderMapping(
                     item_id=str(data["id"]),
@@ -361,12 +927,24 @@ class ZingProvider(MusicProvider):
                 )
             },
         )
+        if images_data := data.get("images"):
+            from music_assistant_models.media_items import MediaItemImage
+            image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
+            if image_url:
+                playlist.metadata.images = UniqueList([
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=image_url,
+                        provider=self.instance_id,
+                    )
+                ])
+        return playlist
 
     def _parse_radio(self, data: dict[str, Any]) -> Radio:
         return Radio(
             item_id=str(data["id"]),
             provider=self.instance_id,
-            name=data.get("title") or data.get("name") or "Unknown Radio",
+            name=data.get("enName") or data.get("heName") or "Unknown Radio",
             provider_mappings={
                 ProviderMapping(
                     item_id=str(data["id"]),
