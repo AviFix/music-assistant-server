@@ -73,6 +73,7 @@ class ZingProvider(MusicProvider):
             ProviderFeature.LIBRARY_PLAYLISTS,
             ProviderFeature.ARTIST_ALBUMS,
             ProviderFeature.ARTIST_TOPTRACKS,
+            ProviderFeature.AUDIO_SOURCE,  # Enable streaming support
         }
 
     async def _graphql(self, query: str, variables: dict[str, Any] | None = None) -> Any:
@@ -119,7 +120,7 @@ class ZingProvider(MusicProvider):
         return data.get("data")
 
     async def search(
-        self, search_query: str, media_types: list[MediaType], limit: int = 5
+        self, search_query: str, media_types: list[MediaType], limit: int = 50
     ) -> SearchResults:
         """Perform a search on the provider."""
         import json
@@ -134,7 +135,7 @@ class ZingProvider(MusicProvider):
                         "enName": search_query
                     }
                 },
-                "size": limit
+                "size": max(limit, 100)  # Use at least 100 results
             }
             track_data = await self._graphql(
                 "query SearchElastic($index: String!, $query: String!) { searchElastic(index: $index, query: $query) }",
@@ -164,7 +165,7 @@ class ZingProvider(MusicProvider):
                         "enName": search_query
                     }
                 },
-                "size": limit
+                "size": max(limit, 100)  # Use at least 100 results
             }
             album_data = await self._graphql(
                 "query SearchElastic($index: String!, $query: String!) { searchElastic(index: $index, query: $query) }",
@@ -194,7 +195,7 @@ class ZingProvider(MusicProvider):
                         "enName": search_query
                     }
                 },
-                "size": limit
+                "size": max(limit, 100)  # Use at least 100 results
             }
             artist_data = await self._graphql(
                 "query SearchElastic($index: String!, $query: String!) { searchElastic(index: $index, query: $query) }",
@@ -541,16 +542,26 @@ class ZingProvider(MusicProvider):
             # Log the constructed URL for debugging
             self.logger.info(f"Constructed audio URL for track {item_id}: {audio_url}")
             
-            return StreamDetails(
+            # Create stream details with the audio URL
+            stream_details = StreamDetails(
                 provider=self.instance_id,
                 item_id=track.item_id,
                 audio_format=AudioFormat(content_type=ContentType.MP3),
-                stream_type=StreamType.CUSTOM,  # Use CUSTOM to enable our custom get_audio_stream method
+                stream_type=StreamType.HTTP,  # Use HTTP for direct streaming
                 path=audio_url,
                 duration=track.duration,
                 can_seek=True,
                 allow_seek=True,
+                enable_cache=False,  # Disable caching to avoid issues with cached stream details
             )
+            
+            # Log the stream details for debugging
+            self.logger.info(f"Created StreamDetails for track {item_id}:")
+            self.logger.info(f"  - path: {stream_details.path}")
+            self.logger.info(f"  - stream_type: {stream_details.stream_type}")
+            self.logger.info(f"  - audio_format: {stream_details.audio_format}")
+            
+            return stream_details
         except Exception as e:
             self.logger.error(f"Error getting stream details for track {item_id}: {e}")
             raise ProviderUnavailableError(f"Failed to get stream details for track {item_id}: {e}")
@@ -559,13 +570,16 @@ class ZingProvider(MusicProvider):
         self, streamdetails: StreamDetails, seek_position: int = 0
     ) -> AsyncGenerator[bytes, None]:
         """Get audio stream with proper headers to bypass CORS."""
-        if not streamdetails.path:
-            raise ProviderUnavailableError("No audio path available")
-        
-        # Log the stream URL for debugging
+        # Log the stream details for debugging
         self.logger.info(f"Starting audio stream for track {streamdetails.item_id}")
         self.logger.info(f"Stream URL: {streamdetails.path}")
+        self.logger.info(f"Stream type: {streamdetails.stream_type}")
+        self.logger.info(f"Audio format: {streamdetails.audio_format}")
         self.logger.info(f"Seek position: {seek_position}")
+        
+        if not streamdetails.path:
+            self.logger.error(f"No audio path available for track {streamdetails.item_id}")
+            raise ProviderUnavailableError("No audio path available")
             
         headers = {
             "User-Agent": "Mozilla/5.0 (compatible; MusicAssistant/1.0)",
@@ -608,202 +622,287 @@ class ZingProvider(MusicProvider):
         """Retrieve all artists from the library."""
         self.logger.info("Starting library artists sync...")
         
-        # Limit to first 100 artists only
-        limit = 100
-        self.logger.info(f"Fetching first {limit} artists only")
+        # Fetch all artists using pagination
+        self.logger.info("Fetching all artists from API using pagination")
         
-        # Use a simple query with limit
-        query = """
-        query GetArtists($take: Int!) { 
-            artists(take: $take) { 
-                id 
-                enName 
-                heName 
-                images { small medium large } 
-            } 
-        }
-        """
+        batch_size = 1000  # Large batch size to reduce API calls
+        skip = 0
+        total_processed = 0
         
-        try:
-            data = await self._graphql(query, {"take": limit})
-            artists_data = data.get("artists", [])
+        while True:
+            query = """
+            query GetArtists($take: Int!, $skip: Int!) { 
+                artists(take: $take, skip: $skip) { 
+                    id 
+                    enName 
+                    heName 
+                    images { small medium large } 
+                } 
+            }
+            """
             
-            self.logger.info(f"Retrieved {len(artists_data)} artists from API")
-            
-            total_processed = 0
-            for item in artists_data:
-                try:
-                    artist = self._parse_artist(item)
-                    total_processed += 1
-                    if total_processed % 50 == 0:  # Log every 50th artist
-                        self.logger.info(f"Processed {total_processed} artists total")
-                    yield artist
-                except Exception as e:
-                    self.logger.error(f"Error parsing artist {item.get('id', 'unknown')}: {e}")
-                    continue
-            
-            # Log completion after all items are yielded
-            self.logger.info(f"Completed library artists sync. Successfully processed {total_processed} artists")
-        except Exception as e:
-            self.logger.error(f"Error during library artists sync: {e}")
-            raise
+            try:
+                data = await self._graphql(query, {"take": batch_size, "skip": skip})
+                artists_data = data.get("artists", [])
+                
+                if not artists_data:
+                    break  # No more data
+                
+                self.logger.info(f"Retrieved batch of {len(artists_data)} artists (skip: {skip})")
+                
+                for artist_data in artists_data:
+                    try:
+                        artist = self._parse_artist(artist_data)
+                        total_processed += 1
+                        if total_processed % 500 == 0:  # Log every 500th artist
+                            self.logger.info(f"Processed {total_processed} artists total")
+                        yield artist
+                    except Exception as e:
+                        self.logger.error(f"Error processing artist {artist_data.get('id', 'unknown')}: {e}")
+                        continue
+                
+                skip += batch_size
+                
+                # If we got fewer results than batch_size, we've reached the end
+                if len(artists_data) < batch_size:
+                    break
+                    
+            except Exception as e:
+                self.logger.error(f"Error during library artists sync batch (skip: {skip}): {e}")
+                break
+        
+        # Log completion after all items are yielded
+        self.logger.info(f"Completed library artists sync. Successfully processed {total_processed} artists")
 
     async def get_library_albums(self) -> AsyncGenerator[Album, None]:
         """Retrieve all albums from the library."""
         self.logger.info("Starting library albums sync...")
         
-        # Limit to first 100 albums only
-        limit = 100
-        self.logger.info(f"Fetching first {limit} albums only")
+        # Fetch all albums using pagination
+        self.logger.info("Fetching all albums from API using pagination")
         
-        # Use a simple query with limit
-        query = """
-        query GetAlbums($take: Int!) { 
-            albums(take: $take) { 
-                id 
-                enName 
-                heName 
-                images { small medium large } 
-                artists { id enName heName images { small medium large } } 
-            } 
-        }
-        """
+        batch_size = 1000  # Large batch size to reduce API calls
+        skip = 0
+        total_processed = 0
         
-        try:
-            data = await self._graphql(query, {"take": limit})
-            albums_data = data.get("albums", [])
+        while True:
+            query = """
+            query GetAlbums($take: Int!, $skip: Int!) { 
+                albums(take: $take, skip: $skip) { 
+                    id 
+                    enName 
+                    heName 
+                    images { small medium large } 
+                    artists { id enName heName images { small medium large } } 
+                } 
+            }
+            """
             
-            self.logger.info(f"Retrieved {len(albums_data)} albums from API")
-            
-            total_processed = 0
-            for item in albums_data:
-                try:
-                    album = self._parse_album(item)
-                    total_processed += 1
-                    if total_processed % 50 == 0:  # Log every 50th album
-                        self.logger.info(f"Processed {total_processed} albums total")
-                    yield album
-                except Exception as e:
-                    self.logger.error(f"Error parsing album {item.get('id', 'unknown')}: {e}")
-                    continue
-            
-            # Log completion after all items are yielded
-            self.logger.info(f"Completed library albums sync. Successfully processed {total_processed} albums")
-        except Exception as e:
-            self.logger.error(f"Error during library albums sync: {e}")
-            raise
+            try:
+                data = await self._graphql(query, {"take": batch_size, "skip": skip})
+                albums_data = data.get("albums", [])
+                
+                if not albums_data:
+                    break  # No more data
+                
+                self.logger.info(f"Retrieved batch of {len(albums_data)} albums (skip: {skip})")
+                
+                for album_data in albums_data:
+                    try:
+                        album = self._parse_album(album_data)
+                        total_processed += 1
+                        if total_processed % 500 == 0:  # Log every 500th album
+                            self.logger.info(f"Processed {total_processed} albums total")
+                        yield album
+                    except Exception as e:
+                        self.logger.error(f"Error processing album {album_data.get('id', 'unknown')}: {e}")
+                        continue
+                
+                skip += batch_size
+                
+                # If we got fewer results than batch_size, we've reached the end
+                if len(albums_data) < batch_size:
+                    break
+                    
+            except Exception as e:
+                self.logger.error(f"Error during library albums sync batch (skip: {skip}): {e}")
+                break
+        
+        # Log completion after all items are yielded
+        self.logger.info(f"Completed library albums sync. Successfully processed {total_processed} albums")
 
     async def get_library_tracks(self) -> AsyncGenerator[Track, None]:
         """Retrieve all tracks from the library."""
         self.logger.info("Starting library tracks sync...")
         
-        # Limit to first 100 tracks only
-        limit = 100
-        self.logger.info(f"Fetching first {limit} tracks only")
+        # Fetch all tracks using pagination
+        self.logger.info("Fetching all tracks from API using pagination")
         
-        # Use a simple query with limit and essential track and artist data
-        query = """
-        query GetTracks($take: Int!) { 
-            tracks(take: $take) { 
-                id 
-                enName 
-                heName 
-                duration 
-                file 
-                artists { 
+        batch_size = 1000  # Large batch size to reduce API calls
+        skip = 0
+        total_processed = 0
+        
+        while True:
+            query = """
+            query GetTracks($take: Int!, $skip: Int!) { 
+                tracks(take: $take, skip: $skip) { 
                     id 
                     enName 
                     heName 
+                    duration 
+                    file 
+                    artists { 
+                        id 
+                        enName 
+                        heName 
+                    } 
                 } 
-            } 
-        }
-        """
-        
-        try:
-            data = await self._graphql(query, {"take": limit})
-            tracks_data = data.get("tracks", [])
+            }
+            """
             
-            self.logger.info(f"Retrieved {len(tracks_data)} tracks from API")
-            
-            total_processed = 0
-            for item in tracks_data:
-                try:
-                    # Create a minimal track with just the basic data
-                    track_name = item.get("heName") or item.get("enName") or "Unknown Artist"
-                    file_path = item.get("file")
-                    
-                    # Parse artists from the track data
-                    artists = []
-                    for artist_data in item.get("artists", []):
-                        artist_name = artist_data.get("heName") or artist_data.get("enName") or "Unknown Artist"
-                        artist = Artist(
-                            item_id=str(artist_data["id"]),
-                            provider=self.instance_id,
-                            name=artist_name,
-                            provider_mappings={
-                                ProviderMapping(
-                                    item_id=str(artist_data["id"]),
-                                    provider_domain=self.domain,
-                                    provider_instance=self.instance_id,
-                                )
-                            },
-                        )
-                        artists.append(artist)
-                    
-                    # If no artists found, create a default "Unknown Artist"
-                    if not artists:
-                        default_artist = Artist(
-                            item_id="unknown",
-                            provider=self.instance_id,
-                            name="Unknown Artist",
-                            provider_mappings={
-                                ProviderMapping(
-                                    item_id="unknown",
-                                    provider_domain=self.domain,
-                                    provider_instance=self.instance_id,
-                                )
-                            },
-                        )
-                        artists.append(default_artist)
-                    
-                    # Create a simple track with artist information
-                    track = Track(
-                        item_id=str(item["id"]),
-                        provider=self.instance_id,
-                        name=track_name,
-                        duration=int(item.get("duration") or 0),
-                        artists=UniqueList(artists),
-                        album=None,  # No album data for now
-                        provider_mappings={
-                            ProviderMapping(
-                                item_id=str(item["id"]),
-                                provider_domain=self.domain,
-                                provider_instance=self.instance_id,
-                                details=file_path,  # Store the file path for streaming
+            try:
+                data = await self._graphql(query, {"take": batch_size, "skip": skip})
+                tracks_data = data.get("tracks", [])
+                
+                if not tracks_data:
+                    break  # No more data
+                
+                self.logger.info(f"Retrieved batch of {len(tracks_data)} tracks (skip: {skip})")
+                
+                for track_data in tracks_data:
+                    try:
+                        # Create a minimal track with just the basic data
+                        track_name = track_data.get("heName") or track_data.get("enName") or "Unknown Artist"
+                        file_path = track_data.get("file")
+                        
+                        # Parse artists from the track data
+                        artists = []
+                        for artist_data in track_data.get("artists", []):
+                            artist_name = artist_data.get("heName") or artist_data.get("enName") or "Unknown Artist"
+                            artist = Artist(
+                                item_id=str(artist_data["id"]),
+                                provider=self.instance_id,
+                                name=artist_name,
+                                provider_mappings={
+                                    ProviderMapping(
+                                        item_id=str(artist_data["id"]),
+                                        provider_domain=self.domain,
+                                        provider_instance=self.instance_id,
+                                    )
+                                },
                             )
-                        },
-                    )
+                            artists.append(artist)
+                        
+                        # If no artists found, create a default "Unknown Artist"
+                        if not artists:
+                            default_artist = Artist(
+                                item_id="unknown",
+                                provider=self.instance_id,
+                                name="Unknown Artist",
+                                provider_mappings={
+                                    ProviderMapping(
+                                        item_id="unknown",
+                                        provider_domain=self.domain,
+                                        provider_instance=self.instance_id,
+                                    )
+                                },
+                            )
+                            artists.append(default_artist)
+                        
+                        # Create a simple track with artist information
+                        track = Track(
+                            item_id=str(track_data["id"]),
+                            provider=self.instance_id,
+                            name=track_name,
+                            duration=int(track_data.get("duration") or 0),
+                            artists=UniqueList(artists),
+                            album=None,  # No album data for now
+                            provider_mappings={
+                                ProviderMapping(
+                                    item_id=str(track_data["id"]),
+                                    provider_domain=self.domain,
+                                    provider_instance=self.instance_id,
+                                    details=file_path,  # Store the file path for streaming
+                                )
+                            },
+                        )
+                        
+                        total_processed += 1
+                        if total_processed % 500 == 0:  # Log every 500th track
+                            self.logger.info(f"Processed {total_processed} tracks total")
+                        yield track
+                    except Exception as e:
+                        self.logger.error(f"Error processing track {track_data.get('id', 'unknown')}: {e}")
+                        continue
+                
+                skip += batch_size
+                
+                # If we got fewer results than batch_size, we've reached the end
+                if len(tracks_data) < batch_size:
+                    break
                     
-                    total_processed += 1
-                    if total_processed % 50 == 0:  # Log every 50th track
-                        self.logger.info(f"Processed {total_processed} tracks total")
-                    yield track
-                except Exception as e:
-                    self.logger.error(f"Error parsing track {item.get('id', 'unknown')}: {e}")
-                    continue
-            
-            # Log completion after all items are yielded
-            self.logger.info(f"Completed library tracks sync. Successfully processed {total_processed} tracks")
-        except Exception as e:
-            self.logger.error(f"Error during library tracks sync: {e}")
-            raise
+            except Exception as e:
+                self.logger.error(f"Error during library tracks sync batch (skip: {skip}): {e}")
+                break
+        
+        # Log completion after all items are yielded
+        self.logger.info(f"Completed library tracks sync. Successfully processed {total_processed} tracks")
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
         """Retrieve all playlists from the library."""
-        # Temporarily disabled due to large number of playlists (124,112)
-        self.logger.info("Library playlists sync temporarily disabled")
-        return
-        yield
+        self.logger.info("Starting library playlists sync...")
+        
+        # Fetch all playlists using pagination
+        self.logger.info("Fetching all playlists from API using pagination")
+        
+        batch_size = 1000  # Large batch size to reduce API calls
+        skip = 0
+        total_processed = 0
+        
+        while True:
+            query = """
+            query GetPlaylists($take: Int!, $skip: Int!) { 
+                playlists(take: $take, skip: $skip) { 
+                    id 
+                    enName 
+                    heName 
+                    images { small medium large } 
+                } 
+            }
+            """
+            
+            try:
+                data = await self._graphql(query, {"take": batch_size, "skip": skip})
+                playlists_data = data.get("playlists", [])
+                
+                if not playlists_data:
+                    break  # No more data
+                
+                self.logger.info(f"Retrieved batch of {len(playlists_data)} playlists (skip: {skip})")
+                
+                for playlist_data in playlists_data:
+                    try:
+                        playlist = self._parse_playlist(playlist_data)
+                        total_processed += 1
+                        if total_processed % 500 == 0:  # Log every 500th playlist
+                            self.logger.info(f"Processed {total_processed} playlists total")
+                        yield playlist
+                    except Exception as e:
+                        self.logger.error(f"Error processing playlist {playlist_data.get('id', 'unknown')}: {e}")
+                        continue
+                
+                skip += batch_size
+                
+                # If we got fewer results than batch_size, we've reached the end
+                if len(playlists_data) < batch_size:
+                    break
+                    
+            except Exception as e:
+                self.logger.error(f"Error during library playlists sync batch (skip: {skip}): {e}")
+                break
+        
+        # Log completion after all items are yielded
+        self.logger.info(f"Completed library playlists sync. Successfully processed {total_processed} playlists")
 
     async def get_library_radios(self) -> AsyncGenerator[Radio, None]:
         """Retrieve all radio stations from the library."""
