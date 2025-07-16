@@ -30,6 +30,8 @@ from music_assistant_models.media_items import (
 from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.models.music_provider import MusicProvider
+from .auth import ZingAuthHelper
+import time
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
@@ -47,6 +49,13 @@ async def setup(
     """Initialize provider(instance) with given configuration."""
     return ZingProvider(mass, manifest, config)
 
+async def store_auth_data(mass, instance_id, auth_data: dict):
+    access_token = auth_data.get("access_token")
+    expiry = time.time() + int(auth_data["expires_in"])
+
+    mass.config.set_raw_provider_config_value(instance_id, "access_token", str(access_token))
+    mass.config.set_raw_provider_config_value(instance_id, "refresh_token", str(auth_data["refresh_token"]))
+    mass.config.set_raw_provider_config_value(instance_id, "expiry", str(expiry))
 
 async def get_config_entries(
     mass: MusicAssistant,
@@ -54,25 +63,44 @@ async def get_config_entries(
     action: str | None = None,
     values: dict[str, Any] | None = None,
 ) -> tuple[ConfigEntry, ...]:
-    """Return Config entries for this provider."""
-    return (
+    from .auth import ZingAuthHelper
+
+    entries = [
         ConfigEntry(
-            key="userId",
+            key="refresh_token",
             type=ConfigEntryType.STRING,
-            label="User ID",
-            description="Enter your Zing user ID (optional, for personalized features)",
-            required=False,
+            label="Firebase Refresh Token",
+            description="Paste your Firebase refresh token here. This is the only required field.",
+            required=True,
             default_value="",
         ),
         ConfigEntry(
-            key="token",
-            type=ConfigEntryType.SECURE_STRING,
-            label="Bearer Token",
-            description="Enter your Zing API Bearer token for Authorization header.",
-            required=False,
-            default_value="",
+            key="login",
+            type=ConfigEntryType.ACTION,
+            label="Login",
+            description="Click to use the refresh token to obtain an access token.",
+            action="login",
         ),
-    )
+    ]
+
+    # Handle login action
+    if action == "login" and values and values.get("refresh_token"):
+        refresh_token = str(values.get("refresh_token") or "")
+        authData = await ZingAuthHelper.login_with_refresh_token(refresh_token)
+        await store_auth_data(mass, instance_id, authData);
+
+          
+    # Show status if authenticated
+    if values and values.get("refresh_token") and values.get("token"):
+        entries.append(
+            ConfigEntry(
+                key="auth_status",
+                type=ConfigEntryType.LABEL,
+                label="Authentication Status",
+                description="✅ Refresh token provided and access token obtained. Authentication is active.",
+            )
+        )
+    return tuple(entries)
 
 
 class ZingProvider(MusicProvider):
@@ -95,13 +123,26 @@ class ZingProvider(MusicProvider):
 
     @property
     def user_id(self) -> str:
-        val = self.config.get_value("userId")
+        val = self.mass.config.get_raw_provider_config_value(self.instance_id, "userId")
+        if not val:
+            self.logger.warning("userId is not set in provider config!")
         return str(val) if val is not None else ""
 
     @property
     def token(self) -> str:
-        val = self.config.get_value("token")
-        return str("eyJhbGciOiJSUzI1NiIsImtpZCI6ImE4ZGY2MmQzYTBhNDRlM2RmY2RjYWZjNmRhMTM4Mzc3NDU5ZjliMDEiLCJ0eXAiOiJKV1QifQ.eyJuYW1lIjoi15DXkdeZIiwicGljdHVyZSI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0k0b3JxUmJhd0NuNTZuVW9pM3FtLWJ2bkdMR0RJWTZ4bTB5VnJYaEZtcXE3cFowOFU9czk2LWMiLCJpc1N1YnNjcmliZWQiOnRydWUsImlzcyI6Imh0dHBzOi8vc2VjdXJldG9rZW4uZ29vZ2xlLmNvbS9hZG1vYi1hcHAtaWQtMzU0OTIyNTE4OCIsImF1ZCI6ImFkbW9iLWFwcC1pZC0zNTQ5MjI1MTg4IiwiYXV0aF90aW1lIjoxNzUyNTE4NTM3LCJ1c2VyX2lkIjoiUFZyVmNyV0d6dWdOTHNIM0VmQ2wzeVNYUGoyMyIsInN1YiI6IlBWclZjcldHenVnTkxzSDNFZkNsM3lTWFBqMjMiLCJpYXQiOjE3NTI1MTg1MzcsImV4cCI6MTc1MjUyMjEzNywiZW1haWwiOiJhdmlmaXhAZ21haWwuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImZpcmViYXNlIjp7ImlkZW50aXRpZXMiOnsiZ29vZ2xlLmNvbSI6WyIxMTMxNDg2Nzk1Njc4NjM0OTk0MzIiXSwiZW1haWwiOlsiYXZpZml4QGdtYWlsLmNvbSJdfSwic2lnbl9pbl9wcm92aWRlciI6Imdvb2dsZS5jb20ifX0.bV0nZBKjUYPPNTfaLCc6pyfk4cLp-Fj61YZKKWUDmwgbYQECkN7T74FpzWEU4Wm2zd6QTgDO-cisYxk9JV6Abk0Z2kFf2cWusgQzweSNUhwz5yh1D_3tnMhs2hj1Y-_m3FDFLtNQe6DXTghezjeCULlDI86JSA6ZxDc842q8c77Nyg16JHLzMLf9EXVVij-gEhhA10l4A-TilgUPzMHz0EpFciHSCKgtFkMB79N0Xyy8EJ-U6q6NBN47koKUpdOx5wYvQ-idS541WjgzVEEK7FBLsUL0xM1cNIu3-xiIf-ID8R6GuCD97rpy4QrwK1LNO7mr2S3zlMoLe9p3DmbIlQ") if val is not None else ""
+        val = self.mass.config.get_raw_provider_config_value(self.instance_id, "access_token")
+        return str(val) if val is not None else ""
+
+    @property
+    def refresh_token(self) -> str:
+        val = self.mass.config.get_raw_provider_config_value(self.instance_id, "refresh_token")
+        return str(val) if val is not None else ""
+    
+    @property
+    def expiry(self) -> str:
+            val = self.mass.config.get_raw_provider_config_value(self.instance_id, "expiry")
+            return str(val) if val is not None else ""
+
 
     async def _graphql(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         """Perform a GraphQL request."""
@@ -110,8 +151,23 @@ class ZingProvider(MusicProvider):
         try:
             request_data = {"query": query, "variables": variables}
             headers = {"Content-Type": "application/json"}
-            if self.token:
-                headers["Authorization"] = f"Bearer {self.token}"
+
+            # Inline token logic since _get_valid_token is removed
+            access_token = self.token
+            expiry = int(float(self.expiry)) if self.expiry else 0
+
+
+            import time
+            from .auth import ZingAuthHelper
+            if not access_token or not expiry or time.time() > expiry:
+                self.logger.info("Access token missing or expired, calling login_with_refresh_token...")
+                auth_data = await ZingAuthHelper.login_with_refresh_token(self.refresh_token)
+                access_token = auth_data.get("access_token")
+
+                await store_auth_data(self.mass, self.instance_id, auth_data)
+
+
+            headers["Authorization"] = f"Bearer {access_token}"
             async with self.mass.http_session.post(
                 self.api_url, json=request_data, headers=headers
             ) as resp:
@@ -129,11 +185,22 @@ class ZingProvider(MusicProvider):
             self.logger.error(f"GraphQL request failed with exception: {e}")
             raise ProviderUnavailableError(str(e)) from e
         if "errors" in data:
+            # Check for auth error
+            for err in data["errors"]:
+                if "Not Authorised" in err.get("message", ""):
+                    self.logger.warning("GraphQL auth error: clearing access token and setting expiry to 0.")
+                    self.mass.config.set_raw_provider_config_value(self.instance_id, "access_token", "")
+                    self.mass.config.set_raw_provider_config_value(self.instance_id, "expiry", "0")
             error_msg = data["errors"][0].get("message", "unknown error")
             self.logger.error(f"GraphQL returned errors: {error_msg}")
             self.logger.error(f"Full GraphQL error data: {data['errors']}")
             raise ProviderUnavailableError(error_msg)
         return data.get("data")
+
+
+
+   
+
 
     async def search(
         self, search_query: str, media_types: list[MediaType], limit: int = 50
@@ -826,12 +893,38 @@ class ZingProvider(MusicProvider):
             },
         )
         
-        # Get images from the album if available, since tracks don't have their own images
-        if album and album.metadata.images:
+        # Set track images with priority: 1) track's own image, 2) album image, 3) artist image
+        track_image_set = False
+        
+        # 1. Try track's own image first
+        if images_data := data.get("images"):
+            from music_assistant_models.media_items import MediaItemImage
+            image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
+            if image_url:
+                track.metadata.images = UniqueList([
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=image_url,
+                        provider=self.instance_id,
+                    )
+                ])
+                self.logger.debug(f"Using track's own image for {track_name}")
+                track_image_set = True
+        
+        # 2. Fallback to album image
+        if not track_image_set and album and album.metadata.images:
             track.metadata.images = album.metadata.images
             self.logger.debug(f"Using album image for track {track_name}")
-        else:
-            self.logger.debug(f"No album image available for track {track_name}")
+            track_image_set = True
+        
+        # 3. Fallback to artist image
+        if not track_image_set and artists and artists[0].metadata.images:
+            track.metadata.images = artists[0].metadata.images
+            self.logger.debug(f"Using artist image for track {track_name}")
+            track_image_set = True
+        
+        if not track_image_set:
+            self.logger.debug(f"No image available for track {track_name}")
             
         return track
 
@@ -856,6 +949,12 @@ class ZingProvider(MusicProvider):
                     )
                 },
             )
+            
+            # Set track images with priority: 1) track's own image, 2) album image, 3) artist image
+            track_image_set = False
+            track_name = data.get('heName') or data.get('enName') or "Unknown Track"
+            
+            # 1. Try track's own image first
             if images_data := data.get("images"):
                 from music_assistant_models.media_items import MediaItemImage
                 image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
@@ -867,6 +966,24 @@ class ZingProvider(MusicProvider):
                             provider=self.instance_id,
                         )
                     ])
+                    self.logger.debug(f"Using track's own image for {track_name}")
+                    track_image_set = True
+            
+            # 2. Fallback to album image
+            if not track_image_set and album and album.metadata.images:
+                track.metadata.images = album.metadata.images
+                self.logger.debug(f"Using album image for track {track_name}")
+                track_image_set = True
+            
+            # 3. Fallback to artist image
+            if not track_image_set and artists and artists[0].metadata.images:
+                track.metadata.images = artists[0].metadata.images
+                self.logger.debug(f"Using artist image for track {track_name}")
+                track_image_set = True
+            
+            if not track_image_set:
+                self.logger.debug(f"No image available for track {track_name}")
+            
             return track
         except (KeyError, ValueError):
             return None
