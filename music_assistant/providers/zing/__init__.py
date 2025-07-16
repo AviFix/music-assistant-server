@@ -53,6 +53,7 @@ async def store_auth_data(mass, instance_id, auth_data: dict):
     access_token = auth_data.get("access_token")
     expiry = time.time() + int(auth_data["expires_in"])
 
+    mass.config.set_raw_provider_config_value(instance_id, "user_id", str(auth_data["user_id"]))
     mass.config.set_raw_provider_config_value(instance_id, "access_token", str(access_token))
     mass.config.set_raw_provider_config_value(instance_id, "refresh_token", str(auth_data["refresh_token"]))
     mass.config.set_raw_provider_config_value(instance_id, "expiry", str(expiry))
@@ -87,19 +88,20 @@ async def get_config_entries(
     if action == "login" and values and values.get("refresh_token"):
         refresh_token = str(values.get("refresh_token") or "")
         authData = await ZingAuthHelper.login_with_refresh_token(refresh_token)
-        await store_auth_data(mass, instance_id, authData);
+        if instance_id:
+            await store_auth_data(mass, instance_id, authData);
 
           
-    # Show status if authenticated
-    if values and values.get("refresh_token") and values.get("token"):
-        entries.append(
-            ConfigEntry(
-                key="auth_status",
-                type=ConfigEntryType.LABEL,
-                label="Authentication Status",
-                description="✅ Refresh token provided and access token obtained. Authentication is active.",
+        # Show status if authenticated
+        if authData and authData.get("refresh_token") and authData.get("access_token"):
+            entries.append(
+                ConfigEntry(
+                    key="auth_status",
+                    type=ConfigEntryType.LABEL,
+                    label="Authentication Status",
+                    description="✅ Refresh token provided and access token obtained. Authentication is active.",
+                )
             )
-        )
     return tuple(entries)
 
 
@@ -123,7 +125,7 @@ class ZingProvider(MusicProvider):
 
     @property
     def user_id(self) -> str:
-        val = self.mass.config.get_raw_provider_config_value(self.instance_id, "userId")
+        val = self.mass.config.get_raw_provider_config_value(self.instance_id, "user_id")
         if not val:
             self.logger.warning("userId is not set in provider config!")
         return str(val) if val is not None else ""
