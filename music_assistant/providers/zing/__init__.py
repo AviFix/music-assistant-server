@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ast import List
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
@@ -74,23 +75,17 @@ async def get_config_entries(
             description="Paste your Firebase refresh token here. This is the only required field.",
             required=True,
             default_value="",
-        ),
-        ConfigEntry(
-            key="login",
-            type=ConfigEntryType.ACTION,
-            label="Login",
-            description="Click to use the refresh token to obtain an access token.",
-            action="login",
-        ),
+        )
     ]
 
     # Handle login action
-    if action == "login" and values and values.get("refresh_token"):
+    if values and values.get("refresh_token"):
         refresh_token = str(values.get("refresh_token") or "")
         authData = await ZingAuthHelper.login_with_refresh_token(refresh_token)
-        if instance_id:
-            await store_auth_data(mass, instance_id, authData);
-
+        
+        # Only store auth data if we have a valid instance_id (not during initial setup)
+        if instance_id and not instance_id.startswith("zing--"):
+            await store_auth_data(mass, instance_id, authData)
           
         # Show status if authenticated
         if authData and authData.get("refresh_token") and authData.get("access_token"):
@@ -122,6 +117,9 @@ class ZingProvider(MusicProvider):
             ProviderFeature.ARTIST_ALBUMS,
             ProviderFeature.ARTIST_TOPTRACKS,
             ProviderFeature.AUDIO_SOURCE,  # Enable streaming support
+            ProviderFeature.BROWSE,        # Add BROWSE support
+            ProviderFeature.LIBRARY_RADIOS,        # Add radio support
+            ProviderFeature.LIBRARY_RADIOS_EDIT,
         }
 
     @property
@@ -199,10 +197,6 @@ class ZingProvider(MusicProvider):
             self.logger.error(f"Full GraphQL error data: {data['errors']}")
             raise ProviderUnavailableError(error_msg)
         return data.get("data")
-
-
-
-   
 
 
     async def search(
@@ -366,27 +360,43 @@ class ZingProvider(MusicProvider):
             raise ProviderUnavailableError(f"Failed to get track {prov_track_id}: {e}")
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
-        """Return the content details for the given track when it will be streamed."""
+        """Return the content details for the given track or radio when it will be streamed."""
+        from music_assistant_models.enums import MediaType
+        from music_assistant_models.media_items import AudioFormat
+        if media_type == MediaType.RADIO:
+            radio = await self.get_radio(item_id)
+            stream_url = None
+            for mapping in radio.provider_mappings:
+                if mapping.details:
+                    stream_url = mapping.details
+                    break
+            if not stream_url:
+                raise ProviderUnavailableError(f"No stream URL found for radio {item_id}")
+            return StreamDetails(
+                provider=self.instance_id,
+                item_id=radio.item_id,
+                audio_format=AudioFormat(content_type=ContentType.MP3),  # adjust if needed
+                stream_type=StreamType.HTTP,
+                path=stream_url,
+                can_seek=False,
+                allow_seek=False,
+            )
+        # Existing track logic below...
         try:
             # Get track details to construct the audio URL
             track = await self.get_track(item_id)
-            
             # Extract the file path from the track's provider mapping details
             file_path = None
             for mapping in track.provider_mappings:
                 if mapping.details:
                     file_path = mapping.details
                     break
-            
             if not file_path:
                 raise ProviderUnavailableError(f"No audio file path found for track {item_id}")
-            
             # Construct the full audio URL
             audio_url = f"{self.api_url.replace(':8443/graphql', '')}/wp-content/uploads/secretmusicfolder1{file_path}"
-            
             # Log the constructed URL for debugging
             self.logger.info(f"Constructed audio URL for track {item_id}: {audio_url}")
-            
             # Create stream details with the audio URL
             stream_details = StreamDetails(
                 provider=self.instance_id,
@@ -399,13 +409,11 @@ class ZingProvider(MusicProvider):
                 allow_seek=True,
                 enable_cache=False,  # Disable caching to avoid issues with cached stream details
             )
-            
             # Log the stream details for debugging
             self.logger.info(f"Created StreamDetails for track {item_id}:")
             self.logger.info(f"  - path: {stream_details.path}")
             self.logger.info(f"  - stream_type: {stream_details.stream_type}")
             self.logger.info(f"  - audio_format: {stream_details.audio_format}")
-            
             return stream_details
         except Exception as e:
             self.logger.error(f"Error getting stream details for track {item_id}: {e}")
@@ -457,9 +465,6 @@ class ZingProvider(MusicProvider):
         except Exception as e:
             self.logger.error(f"Error streaming audio for track {streamdetails.item_id}: {e}")
             raise ProviderUnavailableError(f"Failed to stream audio: {e}")
-
-
-
 
 
     # Library queries
@@ -611,13 +616,70 @@ class ZingProvider(MusicProvider):
 
     async def get_library_radios(self) -> AsyncGenerator[Radio, None]:
         """Retrieve all radio stations from the library."""
-        # Radio functionality not available in this API
-        return
-        yield
+        query = '''
+        query GetRadios($count: Int!) {
+          channels(take: $count) {
+            id
+            enName
+            heName
+            images
+            url
+          }
+        }
+        '''
+        variables = {"count": 100}
+        try:
+            data = await self._graphql(query, variables)
+            radios_data = data.get("channels", [])
+            for item in radios_data:
+                try:
+                    radio = self._parse_radio(item)
+                    yield radio
+                except Exception as e:
+                    self.logger.error(f"Error parsing radio: {e}")
+                    continue
+        except Exception as e:
+            self.logger.error(f"Error fetching radios: {e}")
+            raise
+
+    async def get_radio(self, prov_radio_id: str) -> Radio:
+        """Return radio station details by id."""
+        query = '''
+        query GetRadio($id: Int!) {
+          channel(where: {id: $id}) {
+            id
+            enName
+            heName
+            images
+            url
+          }
+        }
+        '''
+        variables = {"id": int(prov_radio_id)}
+        data = await self._graphql(query, variables)
+        radio_data = data.get("channel") if data else None
+        if not radio_data:
+            raise ProviderUnavailableError(f"Radio {prov_radio_id} not found")
+        return self._parse_radio(radio_data)
 
     #Artists
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Return full artist details."""
+        if prov_artist_id == "unknown":
+            # Return a default artist for unknown cases
+            return Artist(
+                item_id="unknown",
+                provider=self.instance_id,
+                name="Unknown Artist",
+                provider_mappings={
+                    ProviderMapping(
+                        item_id="unknown",
+                        provider_domain=self.domain,
+                        provider_instance=self.instance_id,
+                    )
+                },
+            )
+        
         query = """
         query GetArtist($where: ArtistWhereUniqueInput!) { 
             artist(where: $where) { id enName heName } 
@@ -631,6 +693,10 @@ class ZingProvider(MusicProvider):
 
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Return albums for the given artist."""
+        if prov_artist_id == "unknown":
+            # Return empty list for unknown artist
+            return []
+        
         query = """
         query GetArtistAlbums($where: ArtistWhereUniqueInput!) {
             artist(where: $where) {
@@ -646,6 +712,10 @@ class ZingProvider(MusicProvider):
 
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Return top tracks for the given artist."""
+        if prov_artist_id == "unknown":
+            # Return empty list for unknown artist
+            return []
+        
         query = """
         query GetArtistTop($where: ArtistWhereUniqueInput!) {
             artist(where: $where) {
@@ -685,7 +755,7 @@ class ZingProvider(MusicProvider):
                     duration
                     file
                     artists { id enName heName }
-                    album { id enName heName }
+                    album { id enName heName images { small medium large } }
                 }
             }
         }
@@ -745,11 +815,6 @@ class ZingProvider(MusicProvider):
         return tracks
 
     #Radios
-    async def get_radio(self, prov_radio_id: str) -> Radio:
-        """Return radio station details."""
-        # Radio functionality not available in this API
-        raise ProviderUnavailableError(f"Radio {prov_radio_id} not found")
-
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
         """Retrieve tracks similar to the provided track."""
         # Similar tracks functionality not available in this API
@@ -783,10 +848,19 @@ class ZingProvider(MusicProvider):
         return playlist
 
     def _parse_radio(self, data: dict[str, Any]) -> Radio:
-        return Radio(
+        from music_assistant_models.media_items import MediaItemImage
+        images = data.get("images")
+        image_url = None
+        if isinstance(images, list) and images:
+            image_url = images[0]
+        elif isinstance(images, dict):
+            image_url = images.get("large") or images.get("medium") or images.get("small")
+        elif isinstance(images, str) and images:
+            image_url = images
+        radio = Radio(
             item_id=str(data["id"]),
             provider=self.instance_id,
-            name=data.get("enName") or data.get("heName") or "Unknown Radio",
+            name=data.get("heName") or data.get("enName") or "Unknown Radio",
             provider_mappings={
                 ProviderMapping(
                     item_id=str(data["id"]),
@@ -796,6 +870,15 @@ class ZingProvider(MusicProvider):
                 )
             },
         )
+        if image_url:
+            radio.metadata.images = UniqueList([
+                MediaItemImage(
+                    type=ImageType.THUMB,
+                    path=image_url,
+                    provider=self.instance_id,
+                )
+            ])
+        return radio
 
     def _parse_artist(self, data: dict[str, Any]) -> Artist:
         artist_name = data.get("heName") or data.get("enName") or "Unknown Artist"
@@ -962,19 +1045,9 @@ class ZingProvider(MusicProvider):
             track_name = data.get('heName') or data.get('enName') or "Unknown Track"
             
             # 1. Try track's own image first
-            if images_data := data.get("images"):
-                from music_assistant_models.media_items import MediaItemImage
-                image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
-                if image_url:
-                    track.metadata.images = UniqueList([
-                        MediaItemImage(
-                            type=ImageType.THUMB,
-                            path=image_url,
-                            provider=self.instance_id,
-                        )
-                    ])
-                    self.logger.debug(f"Using track's own image for {track_name}")
-                    track_image_set = True
+            if track and track.image:
+                self.logger.debug(f"Using album image for track {track_name}")
+                track_image_set = True
             
             # 2. Fallback to album image
             if not track_image_set and album and album.metadata.images:
@@ -1032,9 +1105,8 @@ class ZingProvider(MusicProvider):
                     )
                 },
             )
-            if images_data := data.get("images"):
+            if image_url := data.get("thumbnail"):
                 from music_assistant_models.media_items import MediaItemImage
-                image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
                 if image_url:
                     album.metadata.images = UniqueList([
                         MediaItemImage(
@@ -1062,9 +1134,8 @@ class ZingProvider(MusicProvider):
                     )
                 },
             )
-            if images_data := data.get("images"):
+            if image_url := data.get("thumbnail"):
                 from music_assistant_models.media_items import MediaItemImage
-                image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
                 if image_url:
                     artist.metadata.images = UniqueList([
                         MediaItemImage(

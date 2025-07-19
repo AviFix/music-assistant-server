@@ -53,7 +53,7 @@ class ZingAuthHelper:
             async with session.post(url, data=data, headers=headers) as resp:
                 resp.raise_for_status()
                 result = await resp.json()
-                logger.info(f"Received token response: {result}")
+                logger.info(f"Received token response")
                 return result
 
     @staticmethod
