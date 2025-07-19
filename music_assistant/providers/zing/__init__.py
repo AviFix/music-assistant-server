@@ -118,6 +118,7 @@ class ZingProvider(MusicProvider):
             ProviderFeature.LIBRARY_ARTISTS,
             ProviderFeature.LIBRARY_ALBUMS,
             ProviderFeature.LIBRARY_TRACKS,
+            ProviderFeature.LIBRARY_PLAYLISTS,
             ProviderFeature.ARTIST_ALBUMS,
             ProviderFeature.ARTIST_TOPTRACKS,
             ProviderFeature.AUDIO_SOURCE,  # Enable streaming support
@@ -321,11 +322,21 @@ class ZingProvider(MusicProvider):
                         id
                         enName
                         heName
+                        images {
+                            small
+                            medium
+                            large
+                        }
                     }
                     artists {
                         id
                         enName
                         heName
+                        images {
+                            small
+                            medium
+                            large
+                        }
                     }
                     genres {
                         id
@@ -502,7 +513,7 @@ class ZingProvider(MusicProvider):
                 releasedAt
                 genres { id enName heName }
                 images { small medium large }
-                artists { id enName heName }
+                artists { id enName heName images { small medium large } }
               }
             }
           }
@@ -538,6 +549,11 @@ class ZingProvider(MusicProvider):
                 heName
                 fileName
                 duration
+                artists {
+                    id
+                    images { small medium large }
+
+                }
                 album {
                   id
                   images { small medium large }
@@ -618,7 +634,7 @@ class ZingProvider(MusicProvider):
         query = """
         query GetArtistAlbums($where: ArtistWhereUniqueInput!) {
             artist(where: $where) {
-                albums { id enName heName artists { id enName heName } }
+                albums { id enName heName artists { id enName heName images { small medium large } } }
             }
         }
         """
@@ -633,7 +649,7 @@ class ZingProvider(MusicProvider):
         query = """
         query GetArtistTop($where: ArtistWhereUniqueInput!) {
             artist(where: $where) {
-                tracks { id enName heName duration file album { id enName heName } artists { id enName heName } }
+                tracks { id enName heName duration file album { id enName heName images { small medium large } } artists { id enName heName images { small medium large } } }
             }
         }
         """
@@ -648,7 +664,7 @@ class ZingProvider(MusicProvider):
         """Return full album details."""
         query = """
         query GetAlbum($where: AlbumWhereUniqueInput!) { 
-            album(where: $where) { id enName heName artists { id enName heName } } 
+            album(where: $where) { id enName heName images { small medium large } artists { id enName heName images { small medium large } } } 
         }
         """
         data = await self._graphql(query, {"where": {"id": int(prov_album_id)}})
@@ -696,6 +712,8 @@ class ZingProvider(MusicProvider):
 
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0, page_size: int = 100) -> list[Track]:
         """Return the tracks for the given playlist."""
+        if page > 0:
+            return []
         query = """
         query GetPlaylistTracks($playlistId: Int!) {
             playlist(where: { id: $playlistId }) {
@@ -706,8 +724,8 @@ class ZingProvider(MusicProvider):
                         heName
                         file
                         duration
-                        album { id enName heName }
-                        artists { id enName heName }
+                        album { id enName heName images { small medium large } }
+                        artists { id enName heName images { small medium large } }
                     }
                 }
             }
@@ -878,6 +896,13 @@ class ZingProvider(MusicProvider):
         
         artists = [self._parse_artist(art) for art in data.get("artists", [])]
         album = self._parse_album(data["album"]) if data.get("album") else None
+
+        image_url = None
+        if album and getattr(album, "image", None):
+             image_url = getattr(album.image, "path", None)
+
+
+           
         track = Track(
             item_id=str(data["id"]),
             provider=self.instance_id,
@@ -898,35 +923,15 @@ class ZingProvider(MusicProvider):
         # Set track images with priority: 1) track's own image, 2) album image, 3) artist image
         track_image_set = False
         
-        # 1. Try track's own image first
-        if images_data := data.get("images"):
+        if image_url:
             from music_assistant_models.media_items import MediaItemImage
-            image_url = images_data.get("large") or images_data.get("medium") or images_data.get("small")
-            if image_url:
-                track.metadata.images = UniqueList([
-                    MediaItemImage(
-                        type=ImageType.THUMB,
-                        path=image_url,
-                        provider=self.instance_id,
-                    )
-                ])
-                self.logger.debug(f"Using track's own image for {track_name}")
-                track_image_set = True
-        
-        # 2. Fallback to album image
-        if not track_image_set and album and album.metadata.images:
-            track.metadata.images = album.metadata.images
-            self.logger.debug(f"Using album image for track {track_name}")
-            track_image_set = True
-        
-        # 3. Fallback to artist image
-        if not track_image_set and artists and artists[0].metadata.images:
-            track.metadata.images = artists[0].metadata.images
-            self.logger.debug(f"Using artist image for track {track_name}")
-            track_image_set = True
-        
-        if not track_image_set:
-            self.logger.debug(f"No image available for track {track_name}")
+            track.metadata.images = UniqueList([
+                MediaItemImage(
+                    type=ImageType.THUMB,
+                    path=image_url,
+                    provider=self.instance_id,
+                )
+            ])
             
         return track
 
