@@ -114,7 +114,7 @@ DB_TABLE_LOUDNESS_MEASUREMENTS: Final[str] = "loudness_measurements"
 
 # all other
 MASS_LOGO_ONLINE: Final[str] = (
-    "https://github.com/home-assistant/brands/blob/master/core_integrations/music_assistant/icon%402x.png"
+    "https://github.com/music-assistant/server/blob/dev/music_assistant/logo.png"
 )
 ENCRYPT_SUFFIX = "_encrypted_"
 CONFIGURABLE_CORE_CONTROLLERS = (
@@ -710,6 +710,7 @@ CACHE_CATEGORY_MEDIA_INFO: Final[int] = 8
 CACHE_CATEGORY_LIBRARY_ITEMS: Final[int] = 9
 CACHE_CATEGORY_PLAYERS: Final[int] = 10
 CACHE_CATEGORY_RECOMMENDATIONS: Final[int] = 11
+CACHE_CATEGORY_OPEN_SUBSONIC: Final[int] = 12
 
 # CACHE base keys
 CACHE_KEY_PLAYER_POWER: Final[str] = "player_power"
