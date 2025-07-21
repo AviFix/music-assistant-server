@@ -211,8 +211,11 @@ class ZingProvider(MusicProvider):
         if MediaType.TRACK in media_types:
             track_query = {
                 "query": {
-                    "match": {
-                        "enName": search_query
+                    "bool": {
+                        "should": [
+                            {"match": {"enName": search_query}},
+                            {"match": {"heName": search_query}}
+                        ]
                     }
                 },
                 "size": max(limit, 100)  # Use at least 100 results
@@ -241,8 +244,11 @@ class ZingProvider(MusicProvider):
         if MediaType.ALBUM in media_types:
             album_query = {
                 "query": {
-                    "match": {
-                        "enName": search_query
+                    "bool": {
+                        "should": [
+                            {"match": {"enName": search_query}},
+                            {"match": {"heName": search_query}}
+                        ]
                     }
                 },
                 "size": max(limit, 100)  # Use at least 100 results
@@ -271,8 +277,11 @@ class ZingProvider(MusicProvider):
         if MediaType.ARTIST in media_types:
             artist_query = {
                 "query": {
-                    "match": {
-                        "enName": search_query
+                    "bool": {
+                        "should": [
+                            {"match": {"enName": search_query}},
+                            {"match": {"heName": search_query}}
+                        ]
                     }
                 },
                 "size": max(limit, 100)  # Use at least 100 results
